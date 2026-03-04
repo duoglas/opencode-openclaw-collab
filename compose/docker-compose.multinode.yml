@@ -1,0 +1,34 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222", "-sd", "/data"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+
+  worker1:
+    image: ghcr.io/opencode-ai/opencode:latest
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+    ports:
+      - "4096:4096"
+
+  bridge1:
+    build:
+      context: ..
+      dockerfile: compose/ocbridge.Dockerfile
+    environment:
+      NATS_URL: nats://nats:4222
+      NODE_ID: bridge1
+      DISPATCH_SUBJECTS: openclaw.dispatch.v1
+      RESULT_SUBJECTS: openclaw.result.v1
+      OPENCODE_SERVE_HOST: worker1
+      OPENCODE_SERVE_PORT: 4096
+      RUN_TIMEOUT: 900
+    depends_on:
+      - nats
+      - worker1
+
+volumes:
+  nats-data:
