@@ -1,12 +1,12 @@
-# ocbridge MVP 使用说明（Bridge Daemon）
+# ocbridge MVP 使用说明（Bridge Daemon，M1-FREEZE-v1.0）
 
-本说明用于在每台 OpenCode Worker 机器上启动一个 NATS Bridge Daemon：
-- 订阅 OpenClaw 下发的 `oc.task.dispatch.<capability>`
+本说明用于在 OpenCode Worker 机器上启动 NATS Bridge Daemon：
+- 订阅 OpenClaw 下发的 `openclaw.dispatch.v1`（兼容订阅 `op.task.home`）
 - 执行 `opencode run --attach <local serve url>`
-- 上报事件与结果到 NATS
-- 本地落盘 inbox（SQLite）供 TUI/命令查看
+- 回传结果到 `openclaw.result.v1`（兼容双写 `op.result.controller`）
+- 本地落盘 SQLite inbox
 
-> 说明：当前是 MVP，只覆盖任务下发->执行->结果回传的闭环。
+> 说明：当前是 Step2 最小链路闭环版本。
 
 ---
 
@@ -20,23 +20,30 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-确保该机已安装 opencode，并能运行：
+确保该机已安装 opencode：
 ```bash
 opencode --version
 ```
 
 ---
 
-## 2) 配置（环境变量）
+## 2) 配置（环境变量示例）
 
-建议写入 `~/.config/ocbridge/env`（自行选择位置）：
+建议写入 `~/.config/ocbridge/env`：
 
 ```bash
-export NATS_URL='nats://<tailscale-ip>:4222'
+export NATS_URL='nats://100.95.183.80:4222'
 export NODE_ID='homepc-1'
 export CAPABILITY='coding' # coding/doc/qa/ops
-export DISPATCH_SUBJECT='oc.task.dispatch.coding'
-export RESULT_SUBJECT='oc.task.result'
+
+# M1-FREEZE-v1.0 新subject + 旧subject兼容
+export DISPATCH_SUBJECTS='openclaw.dispatch.v1,op.task.home'
+export RESULT_SUBJECTS='openclaw.result.v1,op.result.controller'
+
+# 旧单subject兼容参数（可留空）
+export DISPATCH_SUBJECT=''
+export RESULT_SUBJECT=''
+
 export EVENTS_PREFIX='oc.task.event'
 export HEARTBEAT_SUBJECT='oc.worker.heartbeat'
 export RUN_TIMEOUT='900'
@@ -47,7 +54,7 @@ export OCBRIDGE_DB="$HOME/.local/share/ocbridge/bridge.db"
 
 ---
 
-## 3) 启动
+## 3) 启动 bridge 进程
 
 ```bash
 source ~/.config/ocbridge/env
@@ -56,28 +63,67 @@ source .venv/bin/activate
 python -m ocbridge.bridge_daemon
 ```
 
-启动后它会：
-- 确保本机 `opencode serve` 在 `127.0.0.1:4096` 可用（若不可用则尝试拉起）
-- 订阅 `DISPATCH_SUBJECT`
-- 每 60 秒发送一次心跳到 `HEARTBEAT_SUBJECT`
+启动后行为：
+- 自动确保本机 `opencode serve` 在 `127.0.0.1:4096` 可用
+- 订阅 `openclaw.dispatch.v1` 与 `op.task.home`
+- 结果双写到 `openclaw.result.v1` 与 `op.result.controller`
+- 每 60 秒发送 `oc.worker.heartbeat`
 
 ---
 
-## 4) 本地收件箱（inbox）
+## 4) dispatch → worker → result 端到端跑通步骤
 
-Bridge 会将收发消息落盘在 SQLite：
+### Step A：启动结果监听（控制端）
 
-- `~/.local/share/ocbridge/bridge.db`
+```bash
+# 新subject
+nats sub openclaw.result.v1 --server "$NATS_URL"
+# 旧subject（兼容验证）
+nats sub op.result.controller --server "$NATS_URL"
+```
 
-后续我们会补：
-- `ocbridge cli`：查看最近消息/按 task_id 过滤
-- OpenCode TUI 命令：`/oc-inbox` 等
+### Step B：启动 bridge（worker 侧）
+
+```bash
+python -m ocbridge.bridge_daemon
+```
+
+### Step C：发送 dispatch 消息
+
+```bash
+nats pub openclaw.dispatch.v1 '{
+  "schema":"oc.task.dispatch.v1",
+  "task_id":"TASK-DEMO-001",
+  "capability":"coding",
+  "prompt":"Say hello from ocbridge minimal chain",
+  "model":"openai/gpt-5.3-codex",
+  "workdir":"",
+  "timeout_sec":120,
+  "dedupe_key":"",
+  "requires_approval":false,
+  "created_at":0,
+  "reply_subject":"openclaw.result.v1"
+}' --server "$NATS_URL"
+```
+
+### Step D：验收
+
+- 在 `openclaw.result.v1` 与 `op.result.controller` 都能收到同一 task_id 的结果消息。
+- 本地 DB 可查消息轨迹：
+
+```bash
+sqlite3 "$OCBRIDGE_DB" "select direction,subject,task_id,datetime(ts,'unixepoch') from messages order by id desc limit 20;"
+```
 
 ---
 
-## 5) 下一步（开工清单）
+## 5) 测试
 
-- [ ] JetStream ack/retry（确保 Worker 离线消息不丢）
-- [ ] 增加 Chat subjects：`oc.chat.to.<node>` / `oc.chat.from.<node>`
-- [ ] 增加本地 API（unix socket / localhost HTTP）供 TUI 调用
-- [ ] 增加 session_id 绑定与 `/oc-open <task_id>`
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+当前覆盖：
+- 新旧 subject 解析与去重
+- 结果双写行为
+- 默认 subject 冻结值存在性

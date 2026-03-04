@@ -14,14 +14,56 @@ from .protocol import ChatMessage, TaskDispatch, TaskEvent, TaskResult, WorkerHe
 from .store import Store
 
 
+DEFAULT_DISPATCH_SUBJECTS = "openclaw.dispatch.v1,op.task.home"
+DEFAULT_RESULT_SUBJECTS = "openclaw.result.v1,op.result.controller"
+
+
+def parse_subject_list(raw: str) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in (raw or "").split(","):
+        s = item.strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        items.append(s)
+    return items
+
+
+def resolve_subjects(primary_csv: str, legacy_single: str = "") -> list[str]:
+    merged = parse_subject_list(primary_csv)
+    if legacy_single and legacy_single not in merged:
+        merged.append(legacy_single)
+    return merged
+
+
+async def publish_result_to_subjects(*, bus: NatsBus, store: Store, subjects: list[str], result: TaskResult) -> None:
+    payload = json.loads(result.to_bytes().decode())
+    blob = result.to_bytes()
+    for subject in subjects:
+        store.add_message(direction="out", subject=subject, payload=payload)
+        await bus.publish(subject, blob)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OpenCode NATS bridge daemon (MVP)")
     p.add_argument("--nats", default=os.getenv("NATS_URL", "nats://127.0.0.1:4222"))
     p.add_argument("--node", default=os.getenv("NODE_ID", socket.gethostname()))
     p.add_argument("--cap", default=os.getenv("CAPABILITY", "coding"))
-    p.add_argument("--dispatch", default=os.getenv("DISPATCH_SUBJECT", "oc.task.dispatch.coding"))
+    # M1-FREEZE-v1.0 subjects
+    p.add_argument(
+        "--dispatch-subjects",
+        default=os.getenv("DISPATCH_SUBJECTS", DEFAULT_DISPATCH_SUBJECTS),
+        help="comma-separated subjects to subscribe for dispatch (new+legacy)",
+    )
+    p.add_argument("--dispatch", default=os.getenv("DISPATCH_SUBJECT", ""))  # legacy single-subject fallback
     p.add_argument("--chat", default=os.getenv("CHAT_TO_SUBJECT", ""))
-    p.add_argument("--result", default=os.getenv("RESULT_SUBJECT", "oc.task.result"))
+    p.add_argument(
+        "--result-subjects",
+        default=os.getenv("RESULT_SUBJECTS", DEFAULT_RESULT_SUBJECTS),
+        help="comma-separated subjects to publish results to (new+legacy)",
+    )
+    p.add_argument("--result", default=os.getenv("RESULT_SUBJECT", ""))  # legacy single-subject fallback
     p.add_argument("--events-prefix", default=os.getenv("EVENTS_PREFIX", "oc.task.event"))
     p.add_argument("--heartbeat", default=os.getenv("HEARTBEAT_SUBJECT", "oc.worker.heartbeat"))
     p.add_argument("--db", default=os.getenv("OCBRIDGE_DB", os.path.expanduser("~/.local/share/ocbridge/bridge.db")))
@@ -69,6 +111,13 @@ async def ensure_opencode_serve(host: str, port: int) -> str:
 async def main() -> None:
     args = parse_args()
     store = Store(args.db)
+
+    dispatch_subjects = resolve_subjects(args.dispatch_subjects, args.dispatch)
+    result_subjects = resolve_subjects(args.result_subjects, args.result)
+    if not dispatch_subjects:
+        raise RuntimeError("no dispatch subjects configured")
+    if not result_subjects:
+        raise RuntimeError("no result subjects configured")
 
     bus = NatsBus(args.nats, f"ocbridge-{args.node}")
     await bus.connect()
@@ -124,9 +173,12 @@ async def main() -> None:
                 stderr_tail=(proc.stderr or "")[-4000:],
                 duration_sec=round(time.time() - started, 2),
             )
-            res_payload = json.loads(res.to_bytes().decode())
-            store.add_message(direction="out", subject=args.result, payload=res_payload)
-            await bus.publish(args.result, res.to_bytes())
+            await publish_result_to_subjects(
+                bus=bus,
+                store=store,
+                subjects=result_subjects,
+                result=res,
+            )
             await publish_event(task.task_id, "finished" if proc.returncode == 0 else "failed", f"exit={proc.returncode}")
         except subprocess.TimeoutExpired:
             res = TaskResult(
@@ -139,13 +191,17 @@ async def main() -> None:
                 stderr_tail=f"timeout after {args.run_timeout}s",
                 duration_sec=round(time.time() - started, 2),
             )
-            res_payload = json.loads(res.to_bytes().decode())
-            store.add_message(direction="out", subject=args.result, payload=res_payload)
-            await bus.publish(args.result, res.to_bytes())
+            await publish_result_to_subjects(
+                bus=bus,
+                store=store,
+                subjects=result_subjects,
+                result=res,
+            )
             await publish_event(task.task_id, "failed", "timeout")
 
-    # subscribe to dispatch
-    await bus.subscribe(args.dispatch, cb=handle_dispatch)
+    # subscribe to dispatch (new + legacy)
+    for dispatch_subject in dispatch_subjects:
+        await bus.subscribe(dispatch_subject, cb=handle_dispatch)
 
     async def heartbeat_loop() -> None:
         while True:
