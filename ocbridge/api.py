@@ -4,10 +4,29 @@ import json
 import os
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from .store import Store
 from .queue import get_task_payload, list_pending, mark_task
+
+
+class BridgeHTTPServer(HTTPServer):
+    store: Store | None = None
+    db_path: str = ""
+    mode: str = "auto"
+    node_id: str = ""
+    nats_url: str = ""
+    exec_queue: Any = None
+    publish_callback: Callable[[str, bytes, dict[str, Any]], None] | None = None
+    chat_from_prefix: str = "oc.chat.from."
+
+
+def normalize_subject_prefix(prefix: str) -> str:
+    p = (prefix or "").strip()
+    if not p:
+        return ""
+    return p if p.endswith(".") else f"{p}."
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -67,19 +86,44 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if u.path == "/publish":
-            # Minimal stub for route-A plugin integration.
-            # We currently only persist the outgoing intent for traceability.
-            store: Store = getattr(self.server, "store")
-            store.add_message(
-                direction="out",
-                subject="ocbridge.api.publish",
-                payload={
-                    "schema": "ocbridge.api.publish.v0",
-                    "ts": time.time(),
-                    **body,
-                },
+            text = str(body.get("text") or "").strip()
+            if not text:
+                self._send(400, {"error": "text required"})
+                return
+
+            node_id = str(getattr(self.server, "node_id", "") or "").strip()
+            if not node_id:
+                self._send(400, {"error": "node_id not configured"})
+                return
+
+            payload = {
+                "schema": "oc.chat.v1",
+                "task_id": str(body.get("task_id") or ""),
+                "session_id": str(body.get("session_id") or ""),
+                "from_id": f"node:{node_id}",
+                "to_id": str(body.get("to_id") or "openclaw"),
+                "text": text,
+                "ts": time.time(),
+            }
+            prefix = str(
+                getattr(self.server, "chat_from_prefix", "oc.chat.from.") or ""
             )
-            self._send(200, {"ok": True, "note": "publish is stubbed in v0"})
+            subject = f"{normalize_subject_prefix(prefix)}{node_id}"
+            publisher = getattr(self.server, "publish_callback", None)
+            if publisher is None:
+                self._send(503, {"error": "publish callback unavailable"})
+                return
+            try:
+                publisher(
+                    subject,
+                    json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    payload,
+                )
+            except Exception as exc:
+                self._send(500, {"error": f"publish failed: {exc}"})
+                return
+
+            self._send(200, {"ok": True, "subject": subject})
             return
 
         if u.path == "/mode":
@@ -136,15 +180,19 @@ def make_server(
     node_id: str = "",
     nats_url: str = "",
     exec_queue=None,
+    publish_callback=None,
+    chat_from_prefix: str = "oc.chat.from.",
 ) -> HTTPServer:
     store = Store(db_path)
-    httpd = HTTPServer((host, port), Handler)
+    httpd = BridgeHTTPServer((host, port), Handler)
     httpd.store = store
     httpd.db_path = db_path
     httpd.mode = mode
     httpd.node_id = node_id
     httpd.nats_url = nats_url
     httpd.exec_queue = exec_queue
+    httpd.publish_callback = publish_callback
+    httpd.chat_from_prefix = chat_from_prefix
     return httpd
 
 
@@ -157,15 +205,19 @@ def run_server(
     node_id: str = "",
     nats_url: str = "",
 ) -> None:
-    httpd = make_server(db_path, host, port, mode=mode, node_id=node_id, nats_url=nats_url)
+    httpd = make_server(
+        db_path, host, port, mode=mode, node_id=node_id, nats_url=nats_url
+    )
     httpd.serve_forever()
 
 
 if __name__ == "__main__":
-    db = os.getenv("OCBRIDGE_DB", os.path.expanduser("~/.local/share/ocbridge/bridge.db"))
+    db = os.getenv(
+        "OCBRIDGE_DB", os.path.expanduser("~/.local/share/ocbridge/bridge.db")
+    )
     host = os.getenv("OCBRIDGE_API_HOST", "127.0.0.1")
     port = int(os.getenv("OCBRIDGE_API_PORT", "7341"))
     mode = os.getenv("OCBRIDGE_MODE", "auto")
-    node = os.getenv("NODE_ID", "")
+    node = os.getenv("OC_NODE_ID", os.getenv("NODE_ID", ""))
     nats = os.getenv("NATS_URL", "")
     run_server(db, host=host, port=port, mode=mode, node_id=node, nats_url=nats)

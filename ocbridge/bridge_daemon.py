@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import os
 import socket
 import subprocess
 import time
 from dataclasses import asdict
+from typing import Any, Protocol
 
 from .bus import NatsBus
 from .protocol import ChatMessage, TaskDispatch, TaskEvent, TaskResult, WorkerHeartbeat
@@ -18,6 +20,16 @@ from .queue import enqueue_task
 
 DEFAULT_DISPATCH_SUBJECTS = "openclaw.dispatch.v1,op.task.home"
 DEFAULT_RESULT_SUBJECTS = "openclaw.result.v1,op.result.controller"
+
+
+class _Publisher(Protocol):
+    async def publish(self, subject: str, payload: bytes) -> None: ...
+
+
+class _MessageStore(Protocol):
+    def add_message(
+        self, *, direction: str, subject: str, payload: dict[str, Any]
+    ) -> None: ...
 
 
 def parse_subject_list(raw: str) -> list[str]:
@@ -39,7 +51,68 @@ def resolve_subjects(primary_csv: str, legacy_single: str = "") -> list[str]:
     return merged
 
 
-async def publish_result_to_subjects(*, bus: NatsBus, store: Store, subjects: list[str], result: TaskResult) -> None:
+def normalize_subject_prefix(prefix: str) -> str:
+    p = (prefix or "").strip()
+    if not p:
+        return ""
+    return p if p.endswith(".") else f"{p}."
+
+
+def build_node_subject(prefix: str, node_id: str) -> str:
+    return f"{normalize_subject_prefix(prefix)}{node_id}"
+
+
+def _extract_trace_id(
+    payload: dict[str, object], headers: dict[str, object] | None
+) -> str:
+    trace = str(
+        payload.get("trace_id")
+        or payload.get("trace")
+        or payload.get("x_trace_id")
+        or ""
+    ).strip()
+    if trace:
+        return trace
+    if not headers:
+        return ""
+    normalized = {str(k).strip().lower(): str(v).strip() for k, v in headers.items()}
+    return (
+        normalized.get("x-trace-id")
+        or normalized.get("trace_id")
+        or normalized.get("trace-id")
+        or ""
+    )
+
+
+def build_chat_store_payload(
+    *, subject: str, data: bytes, headers: dict[str, object] | None = None
+) -> dict[str, object]:
+    raw = data.decode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = {"text": raw}
+
+    payload: dict[str, Any] = parsed if isinstance(parsed, dict) else {"value": parsed}
+    raw_ts = payload.get("ts") or payload.get("timestamp") or payload.get("created_at")
+    try:
+        timestamp = float(raw_ts if raw_ts is not None else time.time())
+    except (TypeError, ValueError):
+        timestamp = time.time()
+    trace_id = _extract_trace_id(payload, headers)
+
+    enriched: dict[str, Any] = dict(payload)
+    enriched["schema"] = str(enriched.get("schema") or "oc.chat.v1")
+    enriched["subject"] = subject
+    enriched["trace_id"] = trace_id
+    enriched["timestamp"] = timestamp
+    enriched["ts"] = timestamp
+    return enriched
+
+
+async def publish_result_to_subjects(
+    *, bus: _Publisher, store: _MessageStore, subjects: list[str], result: TaskResult
+) -> None:
     payload = json.loads(result.to_bytes().decode())
     blob = result.to_bytes()
     for subject in subjects:
@@ -50,8 +123,15 @@ async def publish_result_to_subjects(*, bus: NatsBus, store: Store, subjects: li
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OpenCode NATS bridge daemon (MVP)")
     p.add_argument("--nats", default=os.getenv("NATS_URL", "nats://127.0.0.1:4222"))
-    p.add_argument("--creds", default=os.getenv("NATS_CREDS", ""), help="path to NATS .creds (JWT auth)")
-    p.add_argument("--node", default=os.getenv("NODE_ID", socket.gethostname()))
+    p.add_argument(
+        "--creds",
+        default=os.getenv("NATS_CREDS", ""),
+        help="path to NATS .creds (JWT auth)",
+    )
+    p.add_argument(
+        "--node",
+        default=os.getenv("OC_NODE_ID", os.getenv("NODE_ID", socket.gethostname())),
+    )
     p.add_argument("--cap", default=os.getenv("CAPABILITY", "coding"))
 
     # Execution mode
@@ -70,20 +150,48 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("DISPATCH_SUBJECTS", DEFAULT_DISPATCH_SUBJECTS),
         help="comma-separated subjects to subscribe for dispatch (new+legacy)",
     )
-    p.add_argument("--dispatch", default=os.getenv("DISPATCH_SUBJECT", ""))  # legacy single-subject fallback
+    p.add_argument(
+        "--dispatch", default=os.getenv("DISPATCH_SUBJECT", "")
+    )  # legacy single-subject fallback
+    p.add_argument(
+        "--chat-to-prefix", default=os.getenv("CHAT_TO_PREFIX", "oc.chat.to.")
+    )
+    p.add_argument(
+        "--chat-from-prefix", default=os.getenv("CHAT_FROM_PREFIX", "oc.chat.from.")
+    )
+    p.add_argument("--chat-to-subject", default=os.getenv("CHAT_TO_SUBJECT", ""))
     p.add_argument("--chat", default=os.getenv("CHAT_TO_SUBJECT", ""))
     p.add_argument(
         "--result-subjects",
         default=os.getenv("RESULT_SUBJECTS", DEFAULT_RESULT_SUBJECTS),
         help="comma-separated subjects to publish results to (new+legacy)",
     )
-    p.add_argument("--result", default=os.getenv("RESULT_SUBJECT", ""))  # legacy single-subject fallback
-    p.add_argument("--events-prefix", default=os.getenv("EVENTS_PREFIX", "oc.task.event"))
-    p.add_argument("--heartbeat", default=os.getenv("HEARTBEAT_SUBJECT", "oc.worker.heartbeat"))
-    p.add_argument("--db", default=os.getenv("OCBRIDGE_DB", os.path.expanduser("~/.local/share/ocbridge/bridge.db")))
-    p.add_argument("--opencode-serve-host", default=os.getenv("OPENCODE_SERVE_HOST", "127.0.0.1"))
-    p.add_argument("--opencode-serve-port", type=int, default=int(os.getenv("OPENCODE_SERVE_PORT", "4096")))
-    p.add_argument("--run-timeout", type=int, default=int(os.getenv("RUN_TIMEOUT", "900")))
+    p.add_argument(
+        "--result", default=os.getenv("RESULT_SUBJECT", "")
+    )  # legacy single-subject fallback
+    p.add_argument(
+        "--events-prefix", default=os.getenv("EVENTS_PREFIX", "oc.task.event")
+    )
+    p.add_argument(
+        "--heartbeat", default=os.getenv("HEARTBEAT_SUBJECT", "oc.worker.heartbeat")
+    )
+    p.add_argument(
+        "--db",
+        default=os.getenv(
+            "OCBRIDGE_DB", os.path.expanduser("~/.local/share/ocbridge/bridge.db")
+        ),
+    )
+    p.add_argument(
+        "--opencode-serve-host", default=os.getenv("OPENCODE_SERVE_HOST", "127.0.0.1")
+    )
+    p.add_argument(
+        "--opencode-serve-port",
+        type=int,
+        default=int(os.getenv("OPENCODE_SERVE_PORT", "4096")),
+    )
+    p.add_argument(
+        "--run-timeout", type=int, default=int(os.getenv("RUN_TIMEOUT", "900"))
+    )
     return p.parse_args()
 
 
@@ -128,6 +236,12 @@ async def main() -> None:
 
     dispatch_subjects = resolve_subjects(args.dispatch_subjects, args.dispatch)
     result_subjects = resolve_subjects(args.result_subjects, args.result)
+    chat_to_subject = (
+        args.chat_to_subject
+        or args.chat
+        or build_node_subject(args.chat_to_prefix, args.node)
+    )
+    chat_from_subject = build_node_subject(args.chat_from_prefix, args.node)
     if not dispatch_subjects:
         raise RuntimeError("no dispatch subjects configured")
     if not result_subjects:
@@ -136,7 +250,25 @@ async def main() -> None:
     bus = NatsBus(args.nats, f"ocbridge-{args.node}", creds_path=args.creds)
     await bus.connect()
 
-    serve_url = await ensure_opencode_serve(args.opencode_serve_host, args.opencode_serve_port)
+    serve_url = await ensure_opencode_serve(
+        args.opencode_serve_host, args.opencode_serve_port
+    )
+    loop = asyncio.get_running_loop()
+
+    def publish_from_api(subject: str, blob: bytes, payload: dict[str, object]) -> None:
+        async def _publish() -> None:
+            store.add_message(direction="out", subject=subject, payload=payload)
+            await bus.publish(subject, blob)
+
+        future = asyncio.run_coroutine_threadsafe(_publish(), loop)
+
+        def _consume_result(done_future: concurrent.futures.Future[None]) -> None:
+            try:
+                done_future.result()
+            except Exception:
+                return
+
+        future.add_done_callback(_consume_result)
 
     # Start local API for Route-A (TUI plugin) integration.
     # Keep it intentionally simple: HTTP on localhost exposing status/inbox.
@@ -156,10 +288,18 @@ async def main() -> None:
         node_id=args.node,
         nats_url=args.nats,
         exec_queue=exec_queue,
+        publish_callback=publish_from_api,
+        chat_from_prefix=args.chat_from_prefix,
     )
-    asyncio.get_running_loop().run_in_executor(None, _ocbridge_httpd.serve_forever)
+    loop.run_in_executor(None, _ocbridge_httpd.serve_forever)
 
-    async def publish_event(task_id: str, phase: str, message: str = "", progress: int = 0, session_id: str = "") -> None:
+    async def publish_event(
+        task_id: str,
+        phase: str,
+        message: str = "",
+        progress: int = 0,
+        session_id: str = "",
+    ) -> None:
         subject = f"{args.events_prefix}.{task_id}"
         ev = TaskEvent(
             task_id=task_id,
@@ -190,7 +330,9 @@ async def main() -> None:
         ]
         started = time.time()
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.run_timeout)
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=args.run_timeout
+            )
             res = TaskResult(
                 task_id=task.task_id,
                 node_id=args.node,
@@ -207,9 +349,16 @@ async def main() -> None:
                 subjects=result_subjects,
                 result=res,
             )
-            await publish_event(task.task_id, "finished" if proc.returncode == 0 else "failed", f"exit={proc.returncode}")
+            await publish_event(
+                task.task_id,
+                "finished" if proc.returncode == 0 else "failed",
+                f"exit={proc.returncode}",
+            )
             try:
-                store._conn.execute("UPDATE messages SET status=? WHERE task_id=?", ("done" if proc.returncode == 0 else "failed", task.task_id))
+                store._conn.execute(
+                    "UPDATE messages SET status=? WHERE task_id=?",
+                    ("done" if proc.returncode == 0 else "failed", task.task_id),
+                )
                 store._conn.commit()
             except Exception:
                 pass
@@ -232,7 +381,10 @@ async def main() -> None:
             )
             await publish_event(task.task_id, "failed", "timeout")
             try:
-                store._conn.execute("UPDATE messages SET status='timeout' WHERE task_id=?", (task.task_id,))
+                store._conn.execute(
+                    "UPDATE messages SET status='timeout' WHERE task_id=?",
+                    (task.task_id,),
+                )
                 store._conn.commit()
             except Exception:
                 pass
@@ -254,16 +406,28 @@ async def main() -> None:
 
         # mark as claimed/running in inbox
         try:
-            store._conn.execute("UPDATE messages SET status='running' WHERE task_id=?", (task.task_id,))
+            store._conn.execute(
+                "UPDATE messages SET status='running' WHERE task_id=?", (task.task_id,)
+            )
             store._conn.commit()
         except Exception:
             pass
 
         await _run_task(task)
 
+    async def handle_chat(msg) -> None:
+        payload = build_chat_store_payload(
+            subject=msg.subject,
+            data=msg.data,
+            headers=getattr(msg, "header", None),
+        )
+        payload.setdefault("reply_subject", chat_from_subject)
+        store.add_message(direction="in", subject=msg.subject, payload=payload)
+
     # subscribe to dispatch (new + legacy)
     for dispatch_subject in dispatch_subjects:
         await bus.subscribe(dispatch_subject, cb=handle_dispatch)
+    await bus.subscribe(chat_to_subject, cb=handle_chat)
 
     async def manual_exec_loop() -> None:
         # Wait for /run to enqueue task_id, then execute with the same logic as auto mode.
@@ -278,7 +442,10 @@ async def main() -> None:
                 task = TaskDispatch.from_payload(payload)
                 # mark running
                 try:
-                    store._conn.execute("UPDATE messages SET status='running' WHERE task_id=?", (task_id,))
+                    store._conn.execute(
+                        "UPDATE messages SET status='running' WHERE task_id=?",
+                        (task_id,),
+                    )
                     store._conn.commit()
                 except Exception:
                     pass
@@ -288,7 +455,9 @@ async def main() -> None:
 
     async def heartbeat_loop() -> None:
         while True:
-            hb = WorkerHeartbeat(node_id=args.node, capabilities=[args.cap], ts=time.time(), busy=False)
+            hb = WorkerHeartbeat(
+                node_id=args.node, capabilities=[args.cap], ts=time.time(), busy=False
+            )
             payload = json.loads(hb.to_bytes().decode())
             store.add_message(direction="out", subject=args.heartbeat, payload=payload)
             await bus.publish(args.heartbeat, hb.to_bytes())
