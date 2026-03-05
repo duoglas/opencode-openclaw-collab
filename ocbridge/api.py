@@ -8,7 +8,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from .store import Store
-from .queue import get_task_payload, list_pending, mark_task
+from .queue import get_task_payload, list_pending, mark_task, claim_task, get_task_meta
 
 
 class BridgeHTTPServer(HTTPServer):
@@ -52,6 +52,16 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": getattr(self.server, "mode", "auto"),
                     "node": getattr(self.server, "node_id", ""),
                     "nats": getattr(self.server, "nats_url", ""),
+                },
+            )
+            return
+
+        if u.path == "/whoami":
+            self._send(
+                200,
+                {
+                    "node": getattr(self.server, "node_id", ""),
+                    "mode": getattr(self.server, "mode", "auto"),
                 },
             )
             return
@@ -138,16 +148,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/claim":
             task_id = str(body.get("task_id") or "").strip()
+            session_id = str(body.get("session_id") or "").strip()
             if not task_id:
                 self._send(400, {"error": "task_id required"})
                 return
+            if not session_id:
+                self._send(400, {"error": "session_id required"})
+                return
             store: Store = getattr(self.server, "store")
-            n = mark_task(store, task_id, "claimed")
-            self._send(200, {"ok": True, "updated": n})
+            # atomic: only if pending
+            updated = claim_task(store, task_id, session_id)
+            meta = get_task_meta(store, task_id) or {}
+            self._send(200, {"ok": True, "updated": updated, **meta})
             return
 
         if u.path == "/run":
             task_id = str(body.get("task_id") or "").strip()
+            session_id = str(body.get("session_id") or "").strip()
             if not task_id:
                 self._send(400, {"error": "task_id required"})
                 return
@@ -157,15 +174,21 @@ class Handler(BaseHTTPRequestHandler):
             if not payload:
                 self._send(404, {"error": "task not found"})
                 return
+            # Only allow the claimer to run (if claimed)
+            meta = get_task_meta(store, task_id) or {}
+            claimed_by = meta.get("claimed_by") or ""
+            if claimed_by and session_id and claimed_by != session_id:
+                self._send(403, {"error": "not owner"})
+                return
             # Mark status and enqueue to in-process executor queue.
-            mark_task(store, task_id, "ready")
+            mark_task(store, task_id, "ready", claimed_by=claimed_by or session_id)
             q = getattr(self.server, "exec_queue", None)
             if q is not None:
                 try:
                     q.put_nowait(task_id)
                 except Exception:
                     pass
-            self._send(200, {"ok": True, "task_id": task_id, "status": "ready"})
+            self._send(200, {"ok": True, "task_id": task_id, "status": "ready", "claimed_by": claimed_by or session_id})
             return
 
         self._send(404, {"error": "not found"})

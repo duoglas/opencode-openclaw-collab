@@ -26,7 +26,8 @@ class Store:
               schema TEXT,
               task_id TEXT,
               payload_json TEXT NOT NULL,
-              status TEXT DEFAULT ''
+              status TEXT DEFAULT '',
+              claimed_by TEXT DEFAULT ''
             );
             """
         )
@@ -35,10 +36,20 @@ class Store:
             self._conn.execute("ALTER TABLE messages ADD COLUMN status TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        try:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN claimed_by TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
 
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_task_ts ON messages(task_id, ts);"
         )
+        try:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_claimed_by_ts ON messages(claimed_by, ts);"
+            )
+        except sqlite3.OperationalError:
+            pass
         try:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_status_ts ON messages(status, ts);"
@@ -54,9 +65,19 @@ class Store:
         schema = str(payload.get("schema", ""))
         task_id = str(payload.get("task_id", ""))
         status = str(payload.get("status", ""))
+        claimed_by = str(payload.get("claimed_by", ""))
         self._conn.execute(
-            "INSERT INTO messages(ts, direction, subject, schema, task_id, payload_json, status) VALUES(?,?,?,?,?,?,?)",
-            (ts, direction, subject, schema, task_id, json.dumps(payload, ensure_ascii=False), status),
+            "INSERT INTO messages(ts, direction, subject, schema, task_id, payload_json, status, claimed_by) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                ts,
+                direction,
+                subject,
+                schema,
+                task_id,
+                json.dumps(payload, ensure_ascii=False),
+                status,
+                claimed_by,
+            ),
         )
         self._conn.commit()
 
