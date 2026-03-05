@@ -58,6 +58,20 @@ export default {
       const rows = await requestJson(`/inbox?limit=${encodeURIComponent(limit)}`)
       return JSON.stringify(rows, null, 2)
     },
+    'oc-pending': async ({ args }) => {
+      const limit = Number(args?.[0] || 20)
+      const rows = await requestJson(`/pending?limit=${encodeURIComponent(limit)}`)
+      return JSON.stringify(rows, null, 2)
+    },
+    'oc-claim': async ({ args }) => {
+      const taskId = args?.[0]
+      if (!taskId) throw new Error('usage: /oc-claim <task_id>')
+      const out = await requestJson('/claim', {
+        method: 'POST',
+        body: { task_id: taskId },
+      })
+      return JSON.stringify(out, null, 2)
+    },
     'oc-reply': async ({ args }) => {
       const taskId = args?.[0]
       const text = args?.slice(1).join(' ')

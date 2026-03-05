@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .store import Store
+from .queue import list_pending, mark_task
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -42,6 +43,14 @@ class Handler(BaseHTTPRequestHandler):
             task_id = (qs.get("task_id") or [""])[0]
             store: Store = getattr(self.server, "store")
             rows = store.recent(limit=limit, task_id=task_id)
+            self._send(200, rows)
+            return
+
+        if u.path == "/pending":
+            qs = parse_qs(u.query or "")
+            limit = int((qs.get("limit") or ["20"])[0])
+            store: Store = getattr(self.server, "store")
+            rows = list_pending(store, limit=limit)
             self._send(200, rows)
             return
 
@@ -81,6 +90,16 @@ class Handler(BaseHTTPRequestHandler):
             # set on server instance (shared in-process)
             setattr(self.server, "mode", mode)
             self._send(200, {"ok": True, "mode": mode})
+            return
+
+        if u.path == "/claim":
+            task_id = str(body.get("task_id") or "").strip()
+            if not task_id:
+                self._send(400, {"error": "task_id required"})
+                return
+            store: Store = getattr(self.server, "store")
+            n = mark_task(store, task_id, "claimed")
+            self._send(200, {"ok": True, "updated": n})
             return
 
         self._send(404, {"error": "not found"})

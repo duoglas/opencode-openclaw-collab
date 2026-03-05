@@ -12,7 +12,9 @@ class Store:
     def __init__(self, path: str) -> None:
         self.path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path)
+        # check_same_thread=False because the daemon runs asyncio loop and the local HTTP API
+        # in separate threads. We rely on WAL mode + short transactions.
+        self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute(
             """
@@ -23,38 +25,54 @@ class Store:
               subject TEXT NOT NULL,
               schema TEXT,
               task_id TEXT,
-              payload_json TEXT NOT NULL
+              payload_json TEXT NOT NULL,
+              status TEXT DEFAULT ''
             );
             """
         )
+        # Best-effort migration for older DBs
+        try:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN status TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_task_ts ON messages(task_id, ts);"
         )
+        try:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_status_ts ON messages(status, ts);"
+            )
+        except sqlite3.OperationalError:
+            # Older sqlite may throw if column doesn't exist yet; ignore.
+            pass
+
         self._conn.commit()
 
     def add_message(self, *, direction: str, subject: str, payload: dict[str, Any]) -> None:
         ts = float(payload.get("ts") or payload.get("created_at") or time.time())
         schema = str(payload.get("schema", ""))
         task_id = str(payload.get("task_id", ""))
+        status = str(payload.get("status", ""))
         self._conn.execute(
-            "INSERT INTO messages(ts, direction, subject, schema, task_id, payload_json) VALUES(?,?,?,?,?,?)",
-            (ts, direction, subject, schema, task_id, json.dumps(payload, ensure_ascii=False)),
+            "INSERT INTO messages(ts, direction, subject, schema, task_id, payload_json, status) VALUES(?,?,?,?,?,?,?)",
+            (ts, direction, subject, schema, task_id, json.dumps(payload, ensure_ascii=False), status),
         )
         self._conn.commit()
 
     def recent(self, limit: int = 50, task_id: str = "") -> list[dict[str, Any]]:
         if task_id:
             cur = self._conn.execute(
-                "SELECT ts, direction, subject, schema, task_id, payload_json FROM messages WHERE task_id=? ORDER BY ts DESC LIMIT ?",
+                "SELECT ts, direction, subject, schema, task_id, payload_json, status FROM messages WHERE task_id=? ORDER BY ts DESC LIMIT ?",
                 (task_id, limit),
             )
         else:
             cur = self._conn.execute(
-                "SELECT ts, direction, subject, schema, task_id, payload_json FROM messages ORDER BY ts DESC LIMIT ?",
+                "SELECT ts, direction, subject, schema, task_id, payload_json, status FROM messages ORDER BY ts DESC LIMIT ?",
                 (limit,),
             )
         rows = []
-        for ts, direction, subject, schema, task_id, payload_json in cur.fetchall():
+        for ts, direction, subject, schema, task_id, payload_json, status in cur.fetchall():
             rows.append(
                 {
                     "ts": ts,
@@ -62,6 +80,7 @@ class Store:
                     "subject": subject,
                     "schema": schema,
                     "task_id": task_id,
+                    "status": status,
                     "payload": json.loads(payload_json),
                 }
             )

@@ -13,6 +13,7 @@ from .bus import NatsBus
 from .protocol import ChatMessage, TaskDispatch, TaskEvent, TaskResult, WorkerHeartbeat
 from .store import Store
 from .api import make_server
+from .queue import enqueue_task
 
 
 DEFAULT_DISPATCH_SUBJECTS = "openclaw.dispatch.v1,op.task.home"
@@ -195,6 +196,11 @@ async def main() -> None:
                 result=res,
             )
             await publish_event(task.task_id, "finished" if proc.returncode == 0 else "failed", f"exit={proc.returncode}")
+            try:
+                store._conn.execute("UPDATE messages SET status=? WHERE task_id=?", ("done" if proc.returncode == 0 else "failed", task.task_id))
+                store._conn.commit()
+            except Exception:
+                pass
         except subprocess.TimeoutExpired:
             res = TaskResult(
                 task_id=task.task_id,
@@ -213,12 +219,17 @@ async def main() -> None:
                 result=res,
             )
             await publish_event(task.task_id, "failed", "timeout")
+            try:
+                store._conn.execute("UPDATE messages SET status='timeout' WHERE task_id=?", (task.task_id,))
+                store._conn.commit()
+            except Exception:
+                pass
 
     async def handle_dispatch(msg) -> None:
         try:
             payload = json.loads(msg.data.decode())
-            store.add_message(direction="in", subject=msg.subject, payload=payload)
             task = TaskDispatch.from_payload(payload)
+            enqueue_task(store, payload, subject=msg.subject)
         except Exception:
             return
 
@@ -228,6 +239,13 @@ async def main() -> None:
         if current_mode == "manual":
             await publish_event(task.task_id, "queued", "stored (manual mode)")
             return
+
+        # mark as claimed/running in inbox
+        try:
+            store._conn.execute("UPDATE messages SET status='running' WHERE task_id=?", (task.task_id,))
+            store._conn.commit()
+        except Exception:
+            pass
 
         await _run_task(task)
 
