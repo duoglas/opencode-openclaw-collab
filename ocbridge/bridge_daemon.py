@@ -12,6 +12,7 @@ from dataclasses import asdict
 from .bus import NatsBus
 from .protocol import ChatMessage, TaskDispatch, TaskEvent, TaskResult, WorkerHeartbeat
 from .store import Store
+from .api import run_server
 
 
 DEFAULT_DISPATCH_SUBJECTS = "openclaw.dispatch.v1,op.task.home"
@@ -123,6 +124,15 @@ async def main() -> None:
     await bus.connect()
 
     serve_url = await ensure_opencode_serve(args.opencode_serve_host, args.opencode_serve_port)
+
+    # Start local API for Route-A (TUI plugin) integration.
+    # Keep it intentionally simple: HTTP on localhost exposing status/inbox.
+    api_host = os.getenv("OCBRIDGE_API_HOST", "127.0.0.1")
+    api_port = int(os.getenv("OCBRIDGE_API_PORT", "7341"))
+    asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: run_server(args.db, host=api_host, port=api_port),
+    )
 
     async def publish_event(task_id: str, phase: str, message: str = "", progress: int = 0, session_id: str = "") -> None:
         subject = f"{args.events_prefix}.{task_id}"

@@ -1,0 +1,9 @@
+{
+  "name": "ocbridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode command plugin for ocbridge (NATS inbox + dispatch)",
+  "main": "index.js",
+  "dependencies": {}
+}
