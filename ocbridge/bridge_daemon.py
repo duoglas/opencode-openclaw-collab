@@ -15,7 +15,7 @@ from .bus import NatsBus
 from .protocol import ChatMessage, TaskDispatch, TaskEvent, TaskResult, WorkerHeartbeat
 from .store import Store
 from .api import make_server
-from .queue import enqueue_task
+from .queue import enqueue_task, list_pending, get_task_payload, mark_task
 
 
 DEFAULT_DISPATCH_SUBJECTS = "openclaw.dispatch.v1,op.task.home"
@@ -404,7 +404,7 @@ async def main() -> None:
             await publish_event(task.task_id, "queued", "stored (manual mode)")
             return
 
-        # mark as claimed/running in inbox
+        # auto mode: run immediately, but also do a best-effort compensation scan at startup and periodically.
         try:
             store._conn.execute(
                 "UPDATE messages SET status='running' WHERE task_id=?", (task.task_id,)
@@ -429,13 +429,39 @@ async def main() -> None:
         await bus.subscribe(dispatch_subject, cb=handle_dispatch)
     await bus.subscribe(chat_to_subject, cb=handle_chat)
 
+    async def compensate_loop() -> None:
+        """Auto-compensation (MVP): in auto mode, periodically scan for pending+unclaimed tasks
+        and move them to ready so the existing executor path can run them.
+
+        Note: this is intentionally conservative to avoid stealing claimed tasks.
+        """
+        if args.mode != "auto":
+            return
+        interval = int(os.getenv("OCBRIDGE_COMPENSATE_INTERVAL", "10"))
+        while True:
+            try:
+                rows = list_pending(store, limit=50)
+                for r in rows:
+                    payload = (r.get("payload") or {}) if isinstance(r, dict) else {}
+                    task_id = str(payload.get("task_id") or r.get("task_id") or "").strip()
+                    claimed_by = str(r.get("claimed_by") or "").strip()
+                    if not task_id or claimed_by:
+                        continue
+                    # mark ready and enqueue for execution
+                    mark_task(store, task_id, "ready")
+                    try:
+                        await exec_queue.put(task_id)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            await asyncio.sleep(max(2, interval))
+
     async def manual_exec_loop() -> None:
-        # Wait for /run to enqueue task_id, then execute with the same logic as auto mode.
+        # Wait for /run OR compensate loop to enqueue task_id, then execute with the same logic as auto mode.
         while True:
             task_id = await exec_queue.get()
             try:
-                from .queue import get_task_payload
-
                 payload = get_task_payload(store, task_id)
                 if not payload:
                     continue
@@ -463,7 +489,7 @@ async def main() -> None:
             await bus.publish(args.heartbeat, hb.to_bytes())
             await asyncio.sleep(60)
 
-    await asyncio.gather(manual_exec_loop(), heartbeat_loop())
+    await asyncio.gather(manual_exec_loop(), compensate_loop(), heartbeat_loop())
 
 
 if __name__ == "__main__":

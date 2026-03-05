@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .store import Store
 from .queue import get_task_payload, list_pending, mark_task, claim_task, get_task_meta
+from .events import list_events
 
 
 class BridgeHTTPServer(HTTPServer):
@@ -57,11 +58,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if u.path == "/whoami":
+            qs = parse_qs(u.query or "")
+            session_id = (qs.get("session_id") or [""])[0]
             self._send(
                 200,
                 {
                     "node": getattr(self.server, "node_id", ""),
                     "mode": getattr(self.server, "mode", "auto"),
+                    "session_id": session_id,
                 },
             )
             return
@@ -82,6 +86,28 @@ class Handler(BaseHTTPRequestHandler):
             rows = list_pending(store, limit=limit)
             self._send(200, rows)
             return
+
+        if u.path in ("/events", "/watch"):
+            # Long-poll watcher (MVP): query events from the local inbox DB.
+            # Query params:
+            #   since_ts: float unix ts (inclusive)
+            #   timeout_ms: how long to wait for a new event (default 25000)
+            #   limit: max events to return
+            qs = parse_qs(u.query or "")
+            since_ts = float((qs.get("since_ts") or ["0"])[0] or 0)
+            timeout_ms = int((qs.get("timeout_ms") or ["25000"])[0] or 25000)
+            limit = int((qs.get("limit") or ["200"])[0] or 200)
+            deadline = time.time() + max(1, timeout_ms) / 1000.0
+            store: Store = getattr(self.server, "store")
+            while True:
+                rows = list_events(store, since_ts=since_ts, limit=limit)
+                if rows:
+                    self._send(200, {"ok": True, "events": rows})
+                    return
+                if time.time() >= deadline:
+                    self._send(200, {"ok": True, "events": []})
+                    return
+                time.sleep(0.25)
 
         self._send(404, {"error": "not found"})
 
