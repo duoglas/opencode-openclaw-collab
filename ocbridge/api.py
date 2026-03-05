@@ -50,15 +50,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if u.path == "/publish":
-            # This is a stub for route-A plugin integration.
-            # The daemon should wire this to NATS publish of oc.chat.from.<node_id>.
+            # Minimal stub for route-A plugin integration.
+            # We currently only persist the outgoing intent for traceability.
             store: Store = getattr(self.server, "store")
             store.add_message(direction="out", subject="ocbridge.api.publish", payload={
                 "schema": "ocbridge.api.publish.v0",
                 "ts": __import__("time").time(),
                 **body,
             })
-            self._send(200, {"ok": True})
+            self._send(200, {"ok": True, "note": "publish is stubbed in v0"})
             return
 
         self._send(404, {"error": "not found"})

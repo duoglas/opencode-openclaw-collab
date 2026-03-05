@@ -49,8 +49,20 @@ async def publish_result_to_subjects(*, bus: NatsBus, store: Store, subjects: li
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OpenCode NATS bridge daemon (MVP)")
     p.add_argument("--nats", default=os.getenv("NATS_URL", "nats://127.0.0.1:4222"))
+    p.add_argument("--creds", default=os.getenv("NATS_CREDS", ""), help="path to NATS .creds (JWT auth)")
     p.add_argument("--node", default=os.getenv("NODE_ID", socket.gethostname()))
     p.add_argument("--cap", default=os.getenv("CAPABILITY", "coding"))
+
+    # Execution mode
+    # - manual: never run automatically; only enqueue to inbox (TUI can claim/run)
+    # - auto: run immediately on dispatch (for unattended workers)
+    p.add_argument(
+        "--mode",
+        default=os.getenv("OCBRIDGE_MODE", "auto"),
+        choices=["auto", "manual"],
+        help="dispatch handling mode: auto runs immediately; manual only stores to inbox",
+    )
+
     # M1-FREEZE-v1.0 subjects
     p.add_argument(
         "--dispatch-subjects",
@@ -120,7 +132,7 @@ async def main() -> None:
     if not result_subjects:
         raise RuntimeError("no result subjects configured")
 
-    bus = NatsBus(args.nats, f"ocbridge-{args.node}")
+    bus = NatsBus(args.nats, f"ocbridge-{args.node}", creds_path=args.creds)
     await bus.connect()
 
     serve_url = await ensure_opencode_serve(args.opencode_serve_host, args.opencode_serve_port)
@@ -150,14 +162,7 @@ async def main() -> None:
         store.add_message(direction="out", subject=subject, payload=payload)
         await bus.publish(subject, ev.to_bytes())
 
-    async def handle_dispatch(msg) -> None:
-        try:
-            payload = json.loads(msg.data.decode())
-            store.add_message(direction="in", subject=msg.subject, payload=payload)
-            task = TaskDispatch.from_payload(payload)
-        except Exception as exc:
-            return
-
+    async def _run_task(task: TaskDispatch) -> None:
         await publish_event(task.task_id, "queued", "accepted")
         await publish_event(task.task_id, "running", f"model={task.model}")
 
@@ -208,6 +213,21 @@ async def main() -> None:
                 result=res,
             )
             await publish_event(task.task_id, "failed", "timeout")
+
+    async def handle_dispatch(msg) -> None:
+        try:
+            payload = json.loads(msg.data.decode())
+            store.add_message(direction="in", subject=msg.subject, payload=payload)
+            task = TaskDispatch.from_payload(payload)
+        except Exception:
+            return
+
+        # manual mode: only enqueue into inbox. The TUI plugin can later claim/run it.
+        if args.mode == "manual":
+            await publish_event(task.task_id, "queued", "stored (manual mode)")
+            return
+
+        await _run_task(task)
 
     # subscribe to dispatch (new + legacy)
     for dispatch_subject in dispatch_subjects:
