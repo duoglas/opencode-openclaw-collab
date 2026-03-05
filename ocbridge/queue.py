@@ -36,10 +36,21 @@ def list_pending(store: Store, limit: int = 20) -> list[dict[str, Any]]:
 
 
 def mark_task(store: Store, task_id: str, status: str) -> int:
-    # Update by task_id for pending messages.
+    # Update by task_id for messages.
     cur = store._conn.execute(
         "UPDATE messages SET status=? WHERE task_id=?",
         (status, task_id),
     )
     store._conn.commit()
     return cur.rowcount
+
+
+def get_task_payload(store: Store, task_id: str) -> dict[str, Any] | None:
+    cur = store._conn.execute(
+        "SELECT payload_json FROM messages WHERE task_id=? ORDER BY ts DESC LIMIT 1",
+        (task_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return __import__("json").loads(row[0])

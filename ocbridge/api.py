@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .store import Store
-from .queue import list_pending, mark_task
+from .queue import get_task_payload, list_pending, mark_task
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -102,6 +102,28 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "updated": n})
             return
 
+        if u.path == "/run":
+            task_id = str(body.get("task_id") or "").strip()
+            if not task_id:
+                self._send(400, {"error": "task_id required"})
+                return
+            store: Store = getattr(self.server, "store")
+            # ensure it exists
+            payload = get_task_payload(store, task_id)
+            if not payload:
+                self._send(404, {"error": "task not found"})
+                return
+            # Mark status and enqueue to in-process executor queue.
+            mark_task(store, task_id, "ready")
+            q = getattr(self.server, "exec_queue", None)
+            if q is not None:
+                try:
+                    q.put_nowait(task_id)
+                except Exception:
+                    pass
+            self._send(200, {"ok": True, "task_id": task_id, "status": "ready"})
+            return
+
         self._send(404, {"error": "not found"})
 
 
@@ -113,6 +135,7 @@ def make_server(
     mode: str = "auto",
     node_id: str = "",
     nats_url: str = "",
+    exec_queue=None,
 ) -> HTTPServer:
     store = Store(db_path)
     httpd = HTTPServer((host, port), Handler)
@@ -121,6 +144,7 @@ def make_server(
     httpd.mode = mode
     httpd.node_id = node_id
     httpd.nats_url = nats_url
+    httpd.exec_queue = exec_queue
     return httpd
 
 

@@ -72,6 +72,15 @@ export default {
       })
       return JSON.stringify(out, null, 2)
     },
+    'oc-run': async ({ args }) => {
+      const taskId = args?.[0]
+      if (!taskId) throw new Error('usage: /oc-run <task_id>')
+      const out = await requestJson('/run', {
+        method: 'POST',
+        body: { task_id: taskId },
+      })
+      return JSON.stringify(out, null, 2)
+    },
     'oc-reply': async ({ args }) => {
       const taskId = args?.[0]
       const text = args?.slice(1).join(' ')

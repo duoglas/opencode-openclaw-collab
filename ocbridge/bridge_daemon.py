@@ -142,9 +142,21 @@ async def main() -> None:
     # Keep it intentionally simple: HTTP on localhost exposing status/inbox.
     api_host = os.getenv("OCBRIDGE_API_HOST", "127.0.0.1")
     api_port = int(os.getenv("OCBRIDGE_API_PORT", "7341"))
-    # Keep a handle to the HTTP server so we can toggle mode dynamically (/mode).
+    # Executor queue for manual-mode run requests.
+    exec_queue: asyncio.Queue[str] = asyncio.Queue()
+
+    # Keep a handle to the HTTP server so we can toggle mode dynamically (/mode)
+    # and enqueue manual runs (/run).
     global _ocbridge_httpd  # noqa: PLW0603
-    _ocbridge_httpd = make_server(args.db, host=api_host, port=api_port, mode=args.mode, node_id=args.node, nats_url=args.nats)
+    _ocbridge_httpd = make_server(
+        args.db,
+        host=api_host,
+        port=api_port,
+        mode=args.mode,
+        node_id=args.node,
+        nats_url=args.nats,
+        exec_queue=exec_queue,
+    )
     asyncio.get_running_loop().run_in_executor(None, _ocbridge_httpd.serve_forever)
 
     async def publish_event(task_id: str, phase: str, message: str = "", progress: int = 0, session_id: str = "") -> None:
@@ -253,6 +265,27 @@ async def main() -> None:
     for dispatch_subject in dispatch_subjects:
         await bus.subscribe(dispatch_subject, cb=handle_dispatch)
 
+    async def manual_exec_loop() -> None:
+        # Wait for /run to enqueue task_id, then execute with the same logic as auto mode.
+        while True:
+            task_id = await exec_queue.get()
+            try:
+                from .queue import get_task_payload
+
+                payload = get_task_payload(store, task_id)
+                if not payload:
+                    continue
+                task = TaskDispatch.from_payload(payload)
+                # mark running
+                try:
+                    store._conn.execute("UPDATE messages SET status='running' WHERE task_id=?", (task_id,))
+                    store._conn.commit()
+                except Exception:
+                    pass
+                await _run_task(task)
+            finally:
+                exec_queue.task_done()
+
     async def heartbeat_loop() -> None:
         while True:
             hb = WorkerHeartbeat(node_id=args.node, capabilities=[args.cap], ts=time.time(), busy=False)
@@ -261,7 +294,7 @@ async def main() -> None:
             await bus.publish(args.heartbeat, hb.to_bytes())
             await asyncio.sleep(60)
 
-    await heartbeat_loop()
+    await asyncio.gather(manual_exec_loop(), heartbeat_loop())
 
 
 if __name__ == "__main__":
