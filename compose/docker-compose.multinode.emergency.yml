@@ -1,0 +1,37 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    pull_policy: never
+
+  worker1:
+    image: python:3.12-alpine
+    pull_policy: never
+    command: ["python", "-m", "http.server", "4096", "--bind", "0.0.0.0"]
+    ports: []
+
+  bridge1:
+    build:
+      context: ..
+      dockerfile: compose/ocbridge.local.Dockerfile
+    command:
+      - sh
+      - -lc
+      - |
+        python - <<'PY'
+        import socket,time
+        for i in range(60):
+            try:
+                socket.create_connection(("worker1",4096),0.5).close()
+                break
+            except Exception:
+                time.sleep(1)
+        PY
+        exec python -m ocbridge.bridge_daemon --nats nats://nats:4222
+    environment:
+      NATS_URL: nats://nats:4222
+      NODE_ID: bridge1
+      DISPATCH_SUBJECTS: openclaw.dispatch.v1
+      RESULT_SUBJECTS: openclaw.result.v1
+      OPENCODE_SERVE_HOST: worker1
+      OPENCODE_SERVE_PORT: 4096
+      RUN_TIMEOUT: 900

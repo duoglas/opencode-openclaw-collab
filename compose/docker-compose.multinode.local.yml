@@ -1,0 +1,4 @@
+services:
+  worker1:
+    image: python:3.12-alpine
+    command: ["python", "-m", "http.server", "4096", "--bind", "0.0.0.0"]
