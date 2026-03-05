@@ -44,6 +44,7 @@ function requestJson(path, { method = 'GET', body = null } = {}) {
         path: url.pathname + url.search,
         headers: {
           'content-type': 'application/json',
+          'x-session-id': SESSION_ID,
           ...(payload ? { 'content-length': payload.length } : {}),
         },
       },
@@ -118,6 +119,10 @@ export default {
     },
     'oc-session': async () => {
       return JSON.stringify({ session_id: SESSION_ID }, null, 2)
+    },
+    'oc-whoami': async () => {
+      const out = await requestJson('/whoami')
+      return JSON.stringify(out, null, 2)
     },
     'oc-mode': async ({ args }) => {
       const mode = (args?.[0] || '').toLowerCase()

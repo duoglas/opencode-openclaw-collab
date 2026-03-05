@@ -14,9 +14,9 @@ def enqueue_task(store: Store, task_payload: dict[str, Any], *, subject: str = "
 
 
 def list_pending(store: Store, limit: int = 20) -> list[dict[str, Any]]:
-    # Direct SQL query to filter pending quickly.
+    # Include both unclaimed pending and claimed tasks so /pending can show claimed_by.
     cur = store._conn.execute(
-        "SELECT ts, direction, subject, schema, task_id, payload_json, status, claimed_by FROM messages WHERE status='pending' ORDER BY ts DESC LIMIT ?",
+        "SELECT ts, direction, subject, schema, task_id, payload_json, status, claimed_by FROM messages WHERE status IN ('pending', 'claimed') ORDER BY ts DESC LIMIT ?",
         (limit,),
     )
     rows = []

@@ -60,6 +60,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/whoami":
             qs = parse_qs(u.query or "")
             session_id = (qs.get("session_id") or [""])[0]
+            if not session_id:
+                session_id = self.headers.get("X-Session-Id", "")
             self._send(
                 200,
                 {
