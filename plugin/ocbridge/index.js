@@ -47,7 +47,7 @@ function requestJson(path, { method = 'GET', body = null } = {}) {
 
 export default {
   name: 'ocbridge',
-  description: 'ocbridge commands (inbox/status/reply) via local daemon',
+  description: 'ocbridge commands (inbox/status/reply/mode) via local daemon',
   commands: {
     'oc-status': async () => {
       const st = await requestJson('/status')
@@ -65,6 +65,15 @@ export default {
       const out = await requestJson('/publish', {
         method: 'POST',
         body: { kind: 'chat', task_id: taskId, text },
+      })
+      return JSON.stringify(out, null, 2)
+    },
+    'oc-mode': async ({ args }) => {
+      const mode = (args?.[0] || '').toLowerCase()
+      if (!mode || (mode !== 'auto' && mode !== 'manual')) throw new Error('usage: /oc-mode auto|manual')
+      const out = await requestJson('/mode', {
+        method: 'POST',
+        body: { mode },
       })
       return JSON.stringify(out, null, 2)
     },

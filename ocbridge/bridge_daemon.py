@@ -12,7 +12,7 @@ from dataclasses import asdict
 from .bus import NatsBus
 from .protocol import ChatMessage, TaskDispatch, TaskEvent, TaskResult, WorkerHeartbeat
 from .store import Store
-from .api import run_server
+from .api import make_server
 
 
 DEFAULT_DISPATCH_SUBJECTS = "openclaw.dispatch.v1,op.task.home"
@@ -141,10 +141,10 @@ async def main() -> None:
     # Keep it intentionally simple: HTTP on localhost exposing status/inbox.
     api_host = os.getenv("OCBRIDGE_API_HOST", "127.0.0.1")
     api_port = int(os.getenv("OCBRIDGE_API_PORT", "7341"))
-    asyncio.get_running_loop().run_in_executor(
-        None,
-        lambda: run_server(args.db, host=api_host, port=api_port),
-    )
+    # Keep a handle to the HTTP server so we can toggle mode dynamically (/mode).
+    global _ocbridge_httpd  # noqa: PLW0603
+    _ocbridge_httpd = make_server(args.db, host=api_host, port=api_port, mode=args.mode, node_id=args.node, nats_url=args.nats)
+    asyncio.get_running_loop().run_in_executor(None, _ocbridge_httpd.serve_forever)
 
     async def publish_event(task_id: str, phase: str, message: str = "", progress: int = 0, session_id: str = "") -> None:
         subject = f"{args.events_prefix}.{task_id}"
@@ -223,7 +223,9 @@ async def main() -> None:
             return
 
         # manual mode: only enqueue into inbox. The TUI plugin can later claim/run it.
-        if args.mode == "manual":
+        # dynamic mode: the local API can change _ocbridge_httpd.mode at runtime.
+        current_mode = getattr(globals().get("_ocbridge_httpd"), "mode", args.mode)  # type: ignore
+        if current_mode == "manual":
             await publish_event(task.task_id, "queued", "stored (manual mode)")
             return
 
