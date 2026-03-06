@@ -79,6 +79,15 @@ export default {
       const st = await requestJson('/status')
       return JSON.stringify(st, null, 2)
     },
+    'oc-doctor': async () => {
+      const out = await requestJson('/doctor')
+      return JSON.stringify(out, null, 2)
+    },
+    'oc-logs': async ({ args }) => {
+      const lines = Number(args?.[0] || 50)
+      const out = await requestJson(`/logs?lines=${encodeURIComponent(lines)}`)
+      return JSON.stringify(out, null, 2)
+    },
     'oc-inbox': async ({ args }) => {
       const limit = Number(args?.[0] || 20)
       const rows = await requestJson(`/inbox?limit=${encodeURIComponent(limit)}`)

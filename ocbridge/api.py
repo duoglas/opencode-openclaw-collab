@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from . import __version__
 from .store import Store
 from .queue import get_task_payload, list_pending, mark_task, claim_task, get_task_meta
 from .events import list_events
@@ -21,6 +23,11 @@ class BridgeHTTPServer(HTTPServer):
     exec_queue: Any = None
     publish_callback: Callable[[str, bytes, dict[str, Any]], None] | None = None
     chat_from_prefix: str = "oc.chat.from."
+    nats_connected: bool = False
+    subscriptions: list[str] = []
+    last_error: str = ""
+    version: str = __version__
+    logs_path: str = ""
 
 
 def normalize_subject_prefix(prefix: str) -> str:
@@ -28,6 +35,17 @@ def normalize_subject_prefix(prefix: str) -> str:
     if not p:
         return ""
     return p if p.endswith(".") else f"{p}."
+
+
+def _tail_file_lines(path: str, limit: int = 50) -> list[str]:
+    p = Path(path)
+    if not path or not p.exists() or not p.is_file():
+        return []
+    text = p.read_text(encoding="utf-8", errors="replace")
+    lines = [line for line in text.splitlines()]
+    if limit <= 0:
+        return lines
+    return lines[-limit:]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -53,6 +71,55 @@ class Handler(BaseHTTPRequestHandler):
                     "mode": getattr(self.server, "mode", "auto"),
                     "node": getattr(self.server, "node_id", ""),
                     "nats": getattr(self.server, "nats_url", ""),
+                },
+            )
+            return
+
+        if u.path == "/doctor":
+            store: Store = getattr(self.server, "store")
+            db_writable = False
+            db_error = ""
+            try:
+                store._conn.execute("SELECT 1")
+                db_writable = True
+            except Exception as exc:
+                db_error = str(exc)
+
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "version": getattr(self.server, "version", __version__),
+                    "nats": {
+                        "url": getattr(self.server, "nats_url", ""),
+                        "connected": bool(
+                            getattr(self.server, "nats_connected", False)
+                        ),
+                        "subscriptions": list(
+                            getattr(self.server, "subscriptions", []) or []
+                        ),
+                    },
+                    "db": {
+                        "path": getattr(self.server, "db_path", ""),
+                        "writable": db_writable,
+                        "error": db_error,
+                    },
+                    "recent_error": str(getattr(self.server, "last_error", "") or ""),
+                },
+            )
+            return
+
+        if u.path == "/logs":
+            qs = parse_qs(u.query or "")
+            limit = int((qs.get("lines") or ["50"])[0] or 50)
+            logs_path = str(getattr(self.server, "logs_path", "") or "")
+            lines = _tail_file_lines(logs_path, limit=limit)
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "path": logs_path,
+                    "lines": lines,
                 },
             )
             return
@@ -237,6 +304,7 @@ def make_server(
     exec_queue=None,
     publish_callback=None,
     chat_from_prefix: str = "oc.chat.from.",
+    logs_path: str = "",
 ) -> HTTPServer:
     store = Store(db_path)
     httpd = BridgeHTTPServer((host, port), Handler)
@@ -248,6 +316,8 @@ def make_server(
     httpd.exec_queue = exec_queue
     httpd.publish_callback = publish_callback
     httpd.chat_from_prefix = chat_from_prefix
+    httpd.logs_path = logs_path
+    httpd.version = __version__
     return httpd
 
 

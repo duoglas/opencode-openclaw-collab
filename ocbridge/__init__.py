@@ -9,3 +9,5 @@ This package will host:
 Design reference:
 - docs/03-opencode-plugin-NATS双向通信设计.md
 """
+
+__version__ = "0.2.0"
