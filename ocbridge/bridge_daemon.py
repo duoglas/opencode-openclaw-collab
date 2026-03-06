@@ -256,19 +256,18 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
 
     def publish_from_api(subject: str, blob: bytes, payload: dict[str, object]) -> None:
+        ack_timeout = float(os.getenv("OCBRIDGE_PUBLISH_ACK_TIMEOUT", "2.0"))
+
         async def _publish() -> None:
-            store.add_message(direction="out", subject=subject, payload=payload)
             await bus.publish(subject, blob)
+            # flush waits until pending commands are processed by server or timeout.
+            if hasattr(bus, "flush"):
+                await bus.flush(timeout=ack_timeout)
+            store.add_message(direction="out", subject=subject, payload=payload)
 
         future = asyncio.run_coroutine_threadsafe(_publish(), loop)
-
-        def _consume_result(done_future: concurrent.futures.Future[None]) -> None:
-            try:
-                done_future.result()
-            except Exception:
-                return
-
-        future.add_done_callback(_consume_result)
+        # Synchronous bind: /publish returns ok only after publish+flush succeeds.
+        future.result(timeout=max(ack_timeout + 1.0, 3.0))
 
     # Start local API for Route-A (TUI plugin) integration.
     # Keep it intentionally simple: HTTP on localhost exposing status/inbox.
