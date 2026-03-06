@@ -97,8 +97,87 @@ openclaw-gateway 1.6% CPU, 6.2% MEM
 
 ---
 
+## 6) 调度/回写补证（本轮补充）
+
+### 6.1 调度（cron/lane）日志片段
+命令：
+```bash
+grep -nEi "lane task error: lane=cron|cron: job execution timed out|lastRunStatus|nextRunAtMs" /tmp/openclaw/openclaw.log | tail -n 80
+```
+
+关键输出：
+```text
+... lane task error: lane=cron durationMs=239981 error="FailoverError: LLM request timed out."
+... "error": "Error: cron: job execution timed out", "durationMs": 240014
+... lane task error: lane=cron durationMs=1120 error="FailoverError: HTTP 404: 404 page not found"
+... lane task error: lane=cron durationMs=1186 error="FailoverError: HTTP 404: 404 page not found"
+```
+
+解读：
+- 调度面存在两类失败：超时（240s）与 provider 返回 404；符合“20分钟节拍内反复失败”的现象。
+
+### 6.2 回写/网关发送日志片段
+命令：
+```bash
+grep -nEi "gateway/channels/telegram|res ✓ send|deliveryStatus|sendMessage ok" /tmp/openclaw/openclaw.log | tail -n 80
+```
+
+关键输出：
+```text
+... telegram sendMessage ok chat=7895363094 message=3331
+... ⇄ res ✓ send 1752ms channel=telegram ...
+... "deliveryStatus": "delivered"
+... "deliveryStatus": "unknown" (对应 cron: job execution timed out)
+```
+
+解读：
+- 网关回写链路并非全量失败：大量消息回写成功（sendMessage ok / delivered），
+- 但在调度超时窗口出现 `deliveryStatus: unknown`，说明“执行失败→回写状态不确定”链路客观存在。
+
+## 7) 最后通牒补齐：scheduler/run_loop 时间戳采证
+
+### 命令
+```bash
+grep -nEi "scheduler|run_loop|cron run|cron: job|nextRunAtMs|lastRunAtMs|lane=cron" /tmp/openclaw/openclaw.log | tail -n 120
+```
+
+### 输出片段（含时间戳）
+```text
+... "time":"2026-03-06T09:31:04.952+08:00" ... lane task error: lane=main durationMs=300136 error="FailoverError: LLM request timed out."
+... "time":"2026-03-06T09:35:16.030+08:00" ... Gateway agent failed; falling back to embedded: Error: gateway timeout after 150000ms
+... "time":"2026-03-06T09:36:11.820+08:00" ... Gateway agent failed; falling back to embedded: Error: gateway timeout after 330000ms
+... "time":"2026-03-06T09:36:13.955+08:00" ... gateway closed (4000): tick timeout
+... "time":"2026-03-06T09:36:50.430+08:00" ... All models failed ... session file locked (timeout 10000ms)
+```
+
+解读：
+- `09:31~09:36` 窗口内出现连续 run_loop 级异常（模型超时 + gateway超时 + ws异常关闭 + session lock），说明本轮问题具备“短周期高频复发”特征。
+
+## 8) 本轮资源/网络命令即时输出（09:37）
+
+### 资源命令输出摘要
+```text
+uptime: load average 14.92, 19.44, 9.61
+free -h: Mem 7.7Gi / used 4.3Gi / free 1.8Gi / buff-cache 2.0Gi
+Swap: 3.8Gi / used 2.1Gi
+vmstat: CPU idle ~95-97%
+```
+
+### 网络命令输出摘要
+```text
+ss -ltnp | grep 18789 -> LISTEN 127.0.0.1:18789 (pid=2006 openclaw-gateway)
+curl -I http://127.0.0.1:18789/ -> HTTP/1.1 200 OK
+openai probe -> code=401 total=0.961657
+qq probe -> code=401 total=0.091386
+```
+
 ## 证据附件
 - `deliverables/JJC-20260305-004/_timeout_samples.txt`
 - `deliverables/JJC-20260305-004/_net_sample.txt`
 - `deliverables/JJC-20260305-004/_resource_sample.txt`
+- `/tmp/jjc004_dispatch_writeback.txt`
+- `/tmp/jjc004_gateway_writeback.txt`
+- `/tmp/jjc004_scheduler_samples.txt`
+- `/tmp/jjc004_openclaw_log_samples2.txt`
+- `/tmp/jjc004_res_net_commands2.txt`
 
