@@ -202,12 +202,16 @@ class Handler(BaseHTTPRequestHandler):
             if not payload:
                 self._send(404, {"error": "task not found"})
                 return
-            # Only allow the claimer to run (if claimed)
+            # Owner guard: if task is claimed, session_id is mandatory and must match claimer.
             meta = get_task_meta(store, task_id) or {}
-            claimed_by = meta.get("claimed_by") or ""
-            if claimed_by and session_id and claimed_by != session_id:
-                self._send(403, {"error": "not owner"})
-                return
+            claimed_by = str(meta.get("claimed_by") or "")
+            if claimed_by:
+                if not session_id:
+                    self._send(403, {"error": "session_id required for claimed task"})
+                    return
+                if claimed_by != session_id:
+                    self._send(403, {"error": "not owner"})
+                    return
             # Mark status and enqueue to in-process executor queue.
             mark_task(store, task_id, "ready", claimed_by=claimed_by or session_id)
             q = getattr(self.server, "exec_queue", None)

@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from ocbridge.api import make_server
@@ -67,6 +68,82 @@ class SessionClaimLockTest(unittest.TestCase):
             with urlopen(req, timeout=3) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
             self.assertEqual(body.get("session_id"), "sid-header-001")
+
+            httpd.shutdown()
+            httpd.server_close()
+            t.join(timeout=1)
+
+    def test_run_claimed_task_missing_session_id_returns_403(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = f"{td}/bridge.db"
+            store = Store(db)
+            enqueue_task(
+                store,
+                {
+                    "schema": "oc.task.dispatch.v1",
+                    "task_id": "TASK-RUN-001",
+                    "prompt": "ping",
+                    "status": "pending",
+                },
+                subject="openclaw.dispatch.v1",
+            )
+            claim_task(store, "TASK-RUN-001", "sid-owner")
+
+            httpd = make_server(db_path=db, host="127.0.0.1", port=0, mode="manual", node_id="node-a")
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            time.sleep(0.05)
+            port = httpd.server_address[1]
+
+            req = Request(
+                f"http://127.0.0.1:{port}/run",
+                data=json.dumps({"task_id": "TASK-RUN-001"}).encode("utf-8"),
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with self.assertRaises(HTTPError) as ctx:
+                urlopen(req, timeout=3)
+            self.assertEqual(ctx.exception.code, 403)
+            body = json.loads(ctx.exception.read().decode("utf-8"))
+            self.assertIn("session_id required", body.get("error", ""))
+
+            httpd.shutdown()
+            httpd.server_close()
+            t.join(timeout=1)
+
+    def test_run_claimed_task_mismatched_session_id_returns_403(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = f"{td}/bridge.db"
+            store = Store(db)
+            enqueue_task(
+                store,
+                {
+                    "schema": "oc.task.dispatch.v1",
+                    "task_id": "TASK-RUN-002",
+                    "prompt": "ping",
+                    "status": "pending",
+                },
+                subject="openclaw.dispatch.v1",
+            )
+            claim_task(store, "TASK-RUN-002", "sid-owner")
+
+            httpd = make_server(db_path=db, host="127.0.0.1", port=0, mode="manual", node_id="node-a")
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            time.sleep(0.05)
+            port = httpd.server_address[1]
+
+            req = Request(
+                f"http://127.0.0.1:{port}/run",
+                data=json.dumps({"task_id": "TASK-RUN-002", "session_id": "sid-other"}).encode("utf-8"),
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with self.assertRaises(HTTPError) as ctx:
+                urlopen(req, timeout=3)
+            self.assertEqual(ctx.exception.code, 403)
+            body = json.loads(ctx.exception.read().decode("utf-8"))
+            self.assertEqual(body.get("error"), "not owner")
 
             httpd.shutdown()
             httpd.server_close()
