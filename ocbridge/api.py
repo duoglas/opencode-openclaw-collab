@@ -8,7 +8,8 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from .store import Store
-from .queue import get_task_payload, list_pending, mark_task
+from .queue import get_task_payload, list_pending, mark_task, claim_task, get_task_meta
+from .events import list_events
 
 
 class BridgeHTTPServer(HTTPServer):
@@ -56,6 +57,21 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if u.path == "/whoami":
+            qs = parse_qs(u.query or "")
+            session_id = (qs.get("session_id") or [""])[0]
+            if not session_id:
+                session_id = self.headers.get("X-Session-Id", "")
+            self._send(
+                200,
+                {
+                    "node": getattr(self.server, "node_id", ""),
+                    "mode": getattr(self.server, "mode", "auto"),
+                    "session_id": session_id,
+                },
+            )
+            return
+
         if u.path == "/inbox":
             qs = parse_qs(u.query or "")
             limit = int((qs.get("limit") or ["20"])[0])
@@ -72,6 +88,28 @@ class Handler(BaseHTTPRequestHandler):
             rows = list_pending(store, limit=limit)
             self._send(200, rows)
             return
+
+        if u.path in ("/events", "/watch"):
+            # Long-poll watcher (MVP): query events from the local inbox DB.
+            # Query params:
+            #   since_ts: float unix ts (inclusive)
+            #   timeout_ms: how long to wait for a new event (default 25000)
+            #   limit: max events to return
+            qs = parse_qs(u.query or "")
+            since_ts = float((qs.get("since_ts") or ["0"])[0] or 0)
+            timeout_ms = int((qs.get("timeout_ms") or ["25000"])[0] or 25000)
+            limit = int((qs.get("limit") or ["200"])[0] or 200)
+            deadline = time.time() + max(1, timeout_ms) / 1000.0
+            store: Store = getattr(self.server, "store")
+            while True:
+                rows = list_events(store, since_ts=since_ts, limit=limit)
+                if rows:
+                    self._send(200, {"ok": True, "events": rows})
+                    return
+                if time.time() >= deadline:
+                    self._send(200, {"ok": True, "events": []})
+                    return
+                time.sleep(0.25)
 
         self._send(404, {"error": "not found"})
 
@@ -138,16 +176,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if u.path == "/claim":
             task_id = str(body.get("task_id") or "").strip()
+            session_id = str(body.get("session_id") or "").strip()
             if not task_id:
                 self._send(400, {"error": "task_id required"})
                 return
+            if not session_id:
+                self._send(400, {"error": "session_id required"})
+                return
             store: Store = getattr(self.server, "store")
-            n = mark_task(store, task_id, "claimed")
-            self._send(200, {"ok": True, "updated": n})
+            # atomic: only if pending
+            updated = claim_task(store, task_id, session_id)
+            meta = get_task_meta(store, task_id) or {}
+            self._send(200, {"ok": True, "updated": updated, **meta})
             return
 
         if u.path == "/run":
             task_id = str(body.get("task_id") or "").strip()
+            session_id = str(body.get("session_id") or "").strip()
             if not task_id:
                 self._send(400, {"error": "task_id required"})
                 return
@@ -157,15 +202,21 @@ class Handler(BaseHTTPRequestHandler):
             if not payload:
                 self._send(404, {"error": "task not found"})
                 return
+            # Only allow the claimer to run (if claimed)
+            meta = get_task_meta(store, task_id) or {}
+            claimed_by = meta.get("claimed_by") or ""
+            if claimed_by and session_id and claimed_by != session_id:
+                self._send(403, {"error": "not owner"})
+                return
             # Mark status and enqueue to in-process executor queue.
-            mark_task(store, task_id, "ready")
+            mark_task(store, task_id, "ready", claimed_by=claimed_by or session_id)
             q = getattr(self.server, "exec_queue", None)
             if q is not None:
                 try:
                     q.put_nowait(task_id)
                 except Exception:
                     pass
-            self._send(200, {"ok": True, "task_id": task_id, "status": "ready"})
+            self._send(200, {"ok": True, "task_id": task_id, "status": "ready", "claimed_by": claimed_by or session_id})
             return
 
         self._send(404, {"error": "not found"})
