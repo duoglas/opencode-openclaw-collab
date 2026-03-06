@@ -35,6 +35,11 @@ class NatsBus:
             raise RuntimeError("NATS not connected")
         await self._nc.publish(subject, payload)
 
+    async def flush(self, timeout: float = 2.0) -> None:
+        if self._nc is None:
+            raise RuntimeError("NATS not connected")
+        await self._nc.flush(timeout=timeout)
+
     async def subscribe(self, subject: str, cb: Callable[..., Awaitable[None]]):
         if self._nc is None:
             raise RuntimeError("NATS not connected")
