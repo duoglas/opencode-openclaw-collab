@@ -161,6 +161,17 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - `/oc-reply <task_id> <text>`
   - 向控制端回发消息，发布到 `oc.chat.from.<node_id>`。
 
+### 6.2.1 UX 增强命令（JJC-20260306-001）
+
+- `/oc-setup [--force]`
+  - 生成 `~/.config/ocbridge/env` 骨架并脱敏预览当前配置。
+- `/oc-reconfigure [--show] [KEY=value ...]`
+  - 展示当前配置（脱敏）；或通过 `KEY=value` 修改并落盘。
+- `/oc-events [--limit=50] [--since=<ts>] [--follow] [--seconds=30]`
+  - 从本地 daemon `/events` 拉取事件。加 `--follow` 后在窗口内持续刷新。
+- `/oc-follow [--seconds=30] [--timeout-ms=25000] [--limit=50]`
+  - `/oc-events --follow` 的快捷别名。
+
 ### 6.3 典型流程
 
 - Auto：`/oc-mode auto` → 收到任务/聊天 → 自动执行 → 必要时 `/oc-reply` 补充。
