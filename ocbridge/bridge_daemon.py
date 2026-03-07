@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import concurrent.futures
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -16,6 +16,8 @@ from .protocol import ChatMessage, TaskDispatch, TaskEvent, TaskResult, WorkerHe
 from .store import Store
 from .api import make_server
 from .queue import enqueue_task, list_pending, get_task_payload, mark_task
+from .logging_utils import setup_rotating_logger
+from . import __version__
 
 
 DEFAULT_DISPATCH_SUBJECTS = "openclaw.dispatch.v1,op.task.home"
@@ -232,7 +234,11 @@ async def ensure_opencode_serve(host: str, port: int) -> str:
 
 async def main() -> None:
     args = parse_args()
+    logger, log_path = setup_rotating_logger("ocbridge.daemon")
+    logger.info("ocbridge starting version=%s node=%s nats=%s", __version__, args.node, args.nats)
+
     store = Store(args.db)
+    last_error: str = ""
 
     dispatch_subjects = resolve_subjects(args.dispatch_subjects, args.dispatch)
     result_subjects = resolve_subjects(args.result_subjects, args.result)
@@ -249,6 +255,7 @@ async def main() -> None:
 
     bus = NatsBus(args.nats, f"ocbridge-{args.node}", creds_path=args.creds)
     await bus.connect()
+    logger.info("nats connected")
 
     serve_url = await ensure_opencode_serve(
         args.opencode_serve_host, args.opencode_serve_port
@@ -256,6 +263,7 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
 
     def publish_from_api(subject: str, blob: bytes, payload: dict[str, object]) -> None:
+        nonlocal last_error
         ack_timeout = float(os.getenv("OCBRIDGE_PUBLISH_ACK_TIMEOUT", "2.0"))
 
         async def _publish() -> None:
@@ -267,7 +275,12 @@ async def main() -> None:
 
         future = asyncio.run_coroutine_threadsafe(_publish(), loop)
         # Synchronous bind: /publish returns ok only after publish+flush succeeds.
-        future.result(timeout=max(ack_timeout + 1.0, 3.0))
+        try:
+            future.result(timeout=max(ack_timeout + 1.0, 3.0))
+        except Exception as exc:
+            last_error = f"publish_from_api: {exc}"
+            logger.exception("publish from api failed")
+            raise
 
     # Start local API for Route-A (TUI plugin) integration.
     # Keep it intentionally simple: HTTP on localhost exposing status/inbox.
@@ -289,8 +302,21 @@ async def main() -> None:
         exec_queue=exec_queue,
         publish_callback=publish_from_api,
         chat_from_prefix=args.chat_from_prefix,
+        logs_path=log_path,
     )
+    _ocbridge_httpd.nats_connected = True
+    _ocbridge_httpd.last_error = last_error
+    _ocbridge_httpd.version = __version__
     loop.run_in_executor(None, _ocbridge_httpd.serve_forever)
+
+    def record_error(scope: str, exc: Exception) -> None:
+        nonlocal last_error
+        last_error = f"{scope}: {exc}"
+        try:
+            _ocbridge_httpd.last_error = last_error
+        except Exception:
+            pass
+        logger.exception("%s", scope)
 
     async def publish_event(
         task_id: str,
@@ -393,7 +419,8 @@ async def main() -> None:
             payload = json.loads(msg.data.decode())
             task = TaskDispatch.from_payload(payload)
             enqueue_task(store, payload, subject=msg.subject)
-        except Exception:
+        except Exception as exc:
+            record_error("handle_dispatch.parse", exc)
             return
 
         # manual mode: only enqueue into inbox. The TUI plugin can later claim/run it.
@@ -412,7 +439,10 @@ async def main() -> None:
         except Exception:
             pass
 
-        await _run_task(task)
+        try:
+            await _run_task(task)
+        except Exception as exc:
+            record_error("handle_dispatch.run_task", exc)
 
     async def handle_chat(msg) -> None:
         payload = build_chat_store_payload(
@@ -424,9 +454,14 @@ async def main() -> None:
         store.add_message(direction="in", subject=msg.subject, payload=payload)
 
     # subscribe to dispatch (new + legacy)
+    subs: list[str] = []
     for dispatch_subject in dispatch_subjects:
         await bus.subscribe(dispatch_subject, cb=handle_dispatch)
+        subs.append(dispatch_subject)
     await bus.subscribe(chat_to_subject, cb=handle_chat)
+    subs.append(chat_to_subject)
+    _ocbridge_httpd.subscriptions = subs
+    logger.info("subscribed subjects=%s", ",".join(subs))
 
     async def compensate_loop() -> None:
         """Auto-compensation (MVP): in auto mode, periodically scan for pending+unclaimed tasks
@@ -474,7 +509,10 @@ async def main() -> None:
                     store._conn.commit()
                 except Exception:
                     pass
-                await _run_task(task)
+                try:
+                    await _run_task(task)
+                except Exception as exc:
+                    record_error("manual_exec_loop.run_task", exc)
             finally:
                 exec_queue.task_done()
 
@@ -484,11 +522,18 @@ async def main() -> None:
                 node_id=args.node, capabilities=[args.cap], ts=time.time(), busy=False
             )
             payload = json.loads(hb.to_bytes().decode())
-            store.add_message(direction="out", subject=args.heartbeat, payload=payload)
-            await bus.publish(args.heartbeat, hb.to_bytes())
+            try:
+                store.add_message(direction="out", subject=args.heartbeat, payload=payload)
+                await bus.publish(args.heartbeat, hb.to_bytes())
+            except Exception as exc:
+                record_error("heartbeat_loop.publish", exc)
             await asyncio.sleep(60)
 
-    await asyncio.gather(manual_exec_loop(), compensate_loop(), heartbeat_loop())
+    try:
+        await asyncio.gather(manual_exec_loop(), compensate_loop(), heartbeat_loop())
+    except Exception as exc:
+        record_error("main.gather", exc)
+        raise
 
 
 if __name__ == "__main__":
